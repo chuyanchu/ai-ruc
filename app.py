@@ -1767,42 +1767,64 @@ def render_agent(metrics):
                 default=["基金申报", "数字治理"],
             )
         with c3:
-            threshold = st.slider("推送阈值(相似度)", 0.0, 1.0, 0.18, 0.01)
+            current_need = st.text_input("当前诉求 / 待办说明", "想了解基金申报与经费报销的最新政策")
+
+    with st.expander("推送参数 (高级)", expanded=False):
+        col_a, col_b = st.columns(2)
+        with col_a:
+            agent_topk = st.slider("推荐条数", 1, 5, 3, key="agent_topk")
+        with col_b:
+            agent_min_score = st.slider("最低匹配分", 0.0, 1.0, 0.18, 0.01, key="agent_min_score")
 
     if st.button("生成智能推送", type="primary"):
-        texts = [f"{n['title']} {n['content']} {' '.join(n['tags'])}" for n in NOTICES]
-        order, sims = similarity_match(texts, interests + [identity, school])
+        persona_query = " ".join(filter(None, [identity, school, current_need, *interests]))
+        if not persona_query.strip():
+            persona_query = identity
+        hits, low_confidence = rag_search(
+            persona_query,
+            DOCS,
+            VEC,
+            MAT,
+            topk=agent_topk,
+            min_score=agent_min_score,
+        )
         st.markdown("<div style='margin-top:1rem'></div>", unsafe_allow_html=True)
         st.markdown("### 推荐卡片")
-        delivered = 0
-        for idx in order:
-            if sims[idx] >= threshold:
-                notice = NOTICES[idx]
-                delay = 0.12 * delivered + 0.15
+        if low_confidence and hits:
+            st.info("当前匹配分偏低，以下推荐为相似度自动回退结果。")
+
+        if hits:
+            for idx, rec in enumerate(hits, start=1):
+                delay = 0.12 * (idx - 1) + 0.15
+                snippet = rec.get("pure_text") or rec.get("snippet") or rec["chunk"]
+                question_html = ""
+                if rec.get("source_query"):
+                    question_html = (
+                        f"<div class='notification-meta' style='margin-top:4px;'>知识库问法: {html.escape(rec['source_query'])}</div>"
+                    )
                 st.markdown(
                     dedent(
                         f"""
 <div class='notification-card fade-in' style='animation-delay: {delay:.2f}s;'>
-  <h4>{html.escape(notice['title'])}</h4>
+  <h4>{html.escape(rec['title'])}</h4>
   <div class='notification-meta'>
-    来自: {html.escape(notice['dept'])} ｜ 发布: {notice['publish_time']} ｜ 标签: {', '.join(notice['tags'])}
+    来自: {html.escape(rec['dept'])} ｜ 匹配度: {rec['score']:.2f}
   </div>
-  <div style='margin-top: 10px'>{html.escape(notice['content'])}</div>
-  <div style='margin-top: 10px'>截止: {pretty_deadline(notice['deadline'])}</div>
-  <div style='margin-top: 12px'><a href='{notice['url']}' target='_blank'>查看详情</a></div>
+  {question_html}
+  <div style='margin-top: 10px'>{html.escape(snippet)}</div>
+  <div style='margin-top: 12px'><a href='{rec['url']}' target='_blank'>访问相关网址</a></div>
 </div>
                         """
                     ),
                     unsafe_allow_html=True,
                 )
-                delivered += 1
-        if delivered == 0:
+        else:
             st.markdown(
                 dedent(
                     """
 <div class='callout-card fade-in' style='animation-delay: 0.15s;'>
   <h4>暂无符合阈值的推送</h4>
-  <p>尝试降低相似度阈值, 或选择更多兴趣关键词。</p>
+  <p>尝试降低匹配分或补充更具体的诉求与兴趣词。</p>
 </div>
                     """
                 ),
