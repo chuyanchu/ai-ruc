@@ -6,6 +6,7 @@ from datetime import datetime
 from textwrap import dedent
 import os
 import json
+import re
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -15,6 +16,14 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
 DATA_FILES = ("rag_outputs.jsonl", "rag_outputs.json")
+SNIPPET_TAG_RE = re.compile(r"【[^】]+】")
+
+
+def clean_snippet_text(text: str) -> str:
+    text = (text or "").strip()
+    text = SNIPPET_TAG_RE.sub("", text)
+    text = text.replace("。。", "。")
+    return " ".join(text.split())
 
 
 def _iter_json_lines(file_obj):
@@ -88,12 +97,17 @@ def load_data():
                     ]
                 )
                 doc_content = "\n".join(sections)
+                raw_answer = (rag.get("answer") or "").strip()
+                pure_text = clean_snippet_text(raw_answer) if raw_answer else ""
+                if not pure_text:
+                    pure_text = clean_snippet_text(doc_content)
                 docs.append({
                     "id": str(meta.get("id")),
                     "title": meta.get("title", "无标题"),
                     "dept": "信息学院", 
                     "url": meta.get("detail_url", "#"),
                     "content": doc_content,
+                    "pure_text": pure_text,
                     "raw_answer": rag.get("answer", ""),
                     "source_query": rag_question,
                 })
@@ -125,6 +139,7 @@ STATIC_DOCS = [
         "dept": "财务处",
         "url": "#",
         "content": "报销范围: 会议差旅、科研购置... 额度上限: A 类项目单笔不超过 12,000 元...",
+        "pure_text": "标准流程涵盖会议差旅、科研购置等，A 类项目单笔报销上限 12,000 元。",
         "raw_answer": "财务处报销规范涉及会议差旅等，A类限额1.2万。",
         "source_query": "",
     }
@@ -153,6 +168,9 @@ FALLBACK_DOCS = [
             "流程节点: 线上提单 → 院系审核 → 财务复核 → 银行入账。"
             "所需材料: 发票原件、经费批准文件、电子报销单、支付凭证。"
         ),
+        "pure_text": (
+            "可以报销会议差旅、科研购置等，A 类单笔≤12,000 元、B 类≤8,000 元；流程为线上提单、院系审核、财务复核、入账。"
+        ),
     },
     {
         "id": "research_2025_core_journals",
@@ -163,6 +181,9 @@ FALLBACK_DOCS = [
             "A 类: Journal of Public Administration Research and Theory, Government Information Quarterly 等。"
             "信息资源管理学报、Government Information Quarterly、智库管理评论等列为重点推荐。"
             "B 类: 管理世界、中国行政管理、电子政务研究等。"
+        ),
+        "pure_text": (
+            "A 类重点为 Journal of Public Administration Research and Theory、Government Information Quarterly 等，B 类包括管理世界、中国行政管理等。"
         ),
     },
     {
@@ -175,6 +196,9 @@ FALLBACK_DOCS = [
             "就医流程: 线上预约 → 自助机取号 → 医生诊疗 → 药房取药。"
             "报销材料: 挂号票据、诊断证明、药品清单、医保卡复印件。"
         ),
+        "pure_text": (
+            "校医院医保报销 70%，合作医院 50%-65%；就医流程为线上预约、取号、诊疗、取药，并准备发票、诊断证明等材料。"
+        ),
     },
     {
         "id": "it_print_service",
@@ -185,6 +209,9 @@ FALLBACK_DOCS = [
             "打印网点: 艺术楼一层、图书馆负一层、信息楼一层均支持自助打印。"
             "支持纸型: A4 / A3, 黑白 0.2 元/页, 彩色 0.8 元/页, 可绑定校园卡支付。"
             "开放时间: 08:00-22:00, 周末正常开放; 提供远程上传与批量打印。"
+        ),
+        "pure_text": (
+            "艺术楼、图书馆、信息楼提供自助打印，黑白 0.2 元、彩色 0.8 元，可绑定校园卡并支持远程上传、批量打印。"
         ),
     },
 ]
@@ -310,6 +337,8 @@ def rag_search(
     for idx in indices:
         score = float(sims[idx])
         doc = docs[idx]
+        snippet_source = doc.get("pure_text") or doc.get("raw_answer") or doc.get("content", "")
+        snippet_text = smart_truncate(clean_snippet_text(snippet_source), 180)
         entry = {
             "id": doc["id"],
             "title": doc["title"],
@@ -319,6 +348,8 @@ def rag_search(
             "chunk": smart_truncate(doc["content"], 220),
             "content": doc["content"],
             "source_query": doc.get("source_query", ""),
+            "snippet": snippet_text,
+            "pure_text": doc.get("pure_text") or snippet_source,
         }
         if len(fallback) < topk:
             fallback.append(entry)
@@ -334,34 +365,43 @@ def rag_search(
 
 # 汇总检索结果, 生成易读回答
 def synthesize_answer(query: str, hits: list[dict[str, str]]) -> str:
+    """
+    生成上方的主回答卡片，模拟 AI 总结语气。
+    """
     if not hits:
-        return "未检索到相关内容, 请尝试调整关键词或降低引用数量。"
+        return dedent(
+            """
+            <div class='ai-answer'>
+              <div class='ai-answer-meta'>AI 智能助手</div>
+              <p class='ai-answer-main'>抱歉，未检索到与您问题强相关的政策或文档。建议您精简关键词或尝试询问其他业务。</p>
+            </div>
+            """
+        ).strip()
 
-    lead = smart_truncate(hits[0]["content"], 160)
-    matched_question = hits[0].get("source_query")
-    question_line = ""
-    if matched_question:
-        question_line = f"**最匹配的知识库问题**: {html.escape(matched_question)}\n\n"
+    top_hit = hits[0]
+    main_text = top_hit.get("pure_text") or top_hit.get("snippet") or top_hit.get("content", "")
+    main_text = smart_truncate(clean_snippet_text(main_text), 250)
 
-    bullet_lines = []
-    for hit in hits:
-        summary = smart_truncate(hit["content"], 110)
-        question = hit.get("source_query")
-        question_note = f" ｜ 匹配问法: {html.escape(question)}" if question else ""
-        bullet_lines.append(f"- **{html.escape(hit['title'])}** · {summary}{question_note}")
-    bullets = "\n".join(bullet_lines)
+    refs_html = []
+    for i, h in enumerate(hits[:3], start=1):
+        refs_html.append(f"<span class='ai-chip'>引用[{i}] {html.escape(h['title'])}</span>")
+    refs_section = "".join(refs_html)
 
     return dedent(
         f"""
-        **问题洞察**: {html.escape(query)}
+        <div class='ai-answer'>
+          <div class='ai-answer-meta'>AI 智能总结</div>
+          <div class='ai-answer-question'>{html.escape(query)}</div>
+          <p class='ai-answer-main'>{html.escape(main_text)}</p>
 
-        {question_line}{lead}
+          <div class='ai-answer-chips'>
+             {refs_section}
+          </div>
 
-        **引用摘要**
-
-        {bullets}
-
-        _基于 RAG 的权威文档检索与多源交叉验证_
+          <div class='ai-answer-foot'>
+            已根据检索结果为您生成回答，详细出处请见下方“引用来源”。
+          </div>
+        </div>
         """
     ).strip()
 
@@ -943,13 +983,189 @@ def inject_global_styles():
         }
 
         .answer-box {
-          padding: 24px 26px;
+          padding: 28px 30px;
           line-height: 1.65;
+          border: 1px solid var(--glass-border);
+          border-radius: var(--radius-lg);
+          background:
+            linear-gradient(125deg, rgba(75,92,255,0.18), rgba(255,255,255,0.88)),
+            rgba(255,255,255,0.5);
+          box-shadow: 0 35px 85px rgba(79,70,229,0.18);
+          backdrop-filter: blur(28px) saturate(140%);
+          position: relative;
+          overflow: hidden;
+        }
+
+        .answer-box::before,
+        .answer-box::after {
+          content: "";
+          position: absolute;
+          inset: 0;
+          pointer-events: none;
+        }
+
+        .answer-box::before {
+          background: radial-gradient(circle at 10% 10%, rgba(255,255,255,0.55), transparent 60%);
+          opacity: 0.8;
+        }
+
+        .answer-box::after {
+          background: linear-gradient(140deg, rgba(255,255,255,0.08), transparent 55%);
+        }
+
+        .ai-answer {
+          display: flex;
+          flex-direction: column;
+          gap: 1rem;
+          position: relative;
+          z-index: 1;
+        }
+
+        .ai-answer-meta {
+          font-size: .78rem;
+          letter-spacing: 0.2em;
+          text-transform: uppercase;
+          color: rgba(15,23,42,0.65);
+          display: inline-flex;
+          align-items: center;
+          gap: 0.5rem;
+        }
+
+        .ai-answer-meta::before {
+          content: "✨";
+          width: 32px;
+          height: 32px;
+          border-radius: 12px;
+          background: rgba(255,255,255,0.8);
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          font-size: 1rem;
+          color: var(--brand-600);
+          box-shadow: 0 10px 25px rgba(79,70,229,0.25);
+        }
+
+        .ai-answer-question {
+          font-size: 1.18rem;
+          font-weight: 600;
+          color: var(--text-strong);
+        }
+
+        .ai-answer-main {
+          margin: 0;
+          font-size: 1rem;
+          color: var(--text-strong);
+          line-height: 1.8;
+        }
+
+        .ai-answer-chips {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 0.6rem;
+        }
+
+        .ai-chip {
+          padding: 0.4rem 0.85rem;
+          border-radius: 999px;
+          border: 1px solid rgba(91,115,255,0.25);
+          background: linear-gradient(120deg, rgba(255,255,255,0.95), rgba(209,213,255,0.5));
+          font-size: .82rem;
+          color: var(--brand-500);
+          box-shadow: inset 0 0 0 1px rgba(255,255,255,0.7);
+        }
+
+        .ai-answer-foot {
+          font-size: .82rem;
+          color: rgba(15,23,42,0.65);
+          border-top: 1px solid rgba(255,255,255,0.4);
+          padding-top: 0.6rem;
+        }
+
+        .reference-stack {
+          margin-top: 0.8rem;
+          display: flex;
+          flex-direction: column;
+          gap: 1.1rem;
+          position: relative;
+          padding-left: 0.2rem;
+        }
+
+        .reference-divider {
+          margin: 1.4rem 0 0.4rem;
+          display: flex;
+          align-items: center;
+          gap: 0.75rem;
+          font-size: 0.85rem;
+          letter-spacing: 0.08em;
+          text-transform: uppercase;
+          color: rgba(15,23,42,0.65);
+        }
+
+        .reference-divider::after {
+          content: "";
+          flex: 1;
+          height: 1px;
+          background: linear-gradient(90deg, rgba(91,115,255,0.35), rgba(91,115,255,0));
+        }
+
+        .reference-stack::before {
+          content: "";
+          position: absolute;
+          left: 22px;
+          top: 10px;
+          bottom: 10px;
+          width: 2px;
+          background: linear-gradient(180deg, rgba(91,115,255,0.25), rgba(91,115,255,0));
+        }
+
+        .reference-stack > * {
+          position: relative;
+          z-index: 1;
         }
 
         .source-card {
           padding: 22px 24px;
-          margin-top: 1rem;
+          margin-top: 0.6rem;
+          display: flex;
+          gap: 1rem;
+          align-items: flex-start;
+          position: relative;
+          border: 1px solid rgba(91,115,255,0.18);
+          border-radius: var(--radius-lg);
+          background: linear-gradient(150deg, rgba(255,255,255,0.92), rgba(245,248,255,0.78));
+          box-shadow: 0 25px 55px rgba(15,23,42,0.08);
+          backdrop-filter: blur(18px);
+        }
+
+        .source-card::after {
+          content: "";
+          position: absolute;
+          inset: 0;
+          border-radius: inherit;
+          border: 1px solid rgba(255,255,255,0.35);
+          pointer-events: none;
+        }
+
+        .source-card .source-body {
+          flex: 1;
+          position: relative;
+          z-index: 1;
+        }
+
+        .source-index {
+          width: 46px;
+          height: 46px;
+          border-radius: 16px;
+          background: linear-gradient(135deg, #5B66FF, #8ADFD2);
+          border: 1px solid rgba(255,255,255,0.65);
+          color: #fff;
+          font-weight: 700;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          font-size: .95rem;
+          flex-shrink: 0;
+          box-shadow: 0 18px 35px rgba(50,65,197,0.25);
         }
 
         .notification-card {
@@ -1427,9 +1643,15 @@ def render_rag(metrics):
 
     col_left, col_right = st.columns([1.8, 1])
     with col_left:
-        query = st.text_input("请输入问题", value="我想报销, 核心期刊的标准是什么？")
-        topk = st.slider("返回引用数量", 1, 5, 3)
-        min_score = st.slider("最低相似度阈值", 0.0, 1.0, 0.15, 0.01)
+        query = st.text_input("请输入问题", value="最近有哪些教授发表了高质量的论文")
+
+        with st.expander("检索参数设置 (高级)", expanded=False):
+            c1, c2 = st.columns(2)
+            with c1:
+                topk = st.slider("返回引用数量", 1, 5, 3, key="rag_topk")
+            with c2:
+                min_score = st.slider("最低相似度阈值", 0.0, 1.0, 0.15, 0.01, key="rag_minscore")
+
         if st.button("检索并生成回答", type="primary"):
             with st.spinner("正在检索权威资料并汇总要点…"):
                 hits, low_confidence = rag_search(
@@ -1441,34 +1663,54 @@ def render_rag(metrics):
                     min_score=min_score,
                 )
                 answer = synthesize_answer(query, hits)
+
             st.markdown(f"<div class='answer-box'>{answer}</div>", unsafe_allow_html=True)
+
+            if hits and low_confidence:
+                st.warning("提示：检索结果相似度较低，以下内容仅供参考。")
+
             if hits:
-                if low_confidence:
-                    st.info("所有结果均低于当前阈值，已按相似度自动回退展示。")
-                st.markdown("**引用来源**")
-                for h in hits:
-                    question_html = ""
+                st.markdown(
+                    "<div class='reference-divider'>引用来源 · Reference Sources</div>",
+                    unsafe_allow_html=True,
+                )
+                st.markdown("<div class='reference-stack'>", unsafe_allow_html=True)
+                for idx, h in enumerate(hits, start=1):
+                    body_text = h.get("pure_text") or h.get("snippet") or h["chunk"]
+                    body_text = smart_truncate(body_text, 180)
+                    match_info = ""
                     if h.get("source_query"):
-                        question_html = (
-                            f"<div style='margin-top: 6px; color: var(--text-muted);'>匹配问法: "
+                        match_info = (
+                            f"<div style='font-size: 0.85rem; color: #64748B; margin-bottom:4px;'>匹配知识库问答: "
                             f"{html.escape(h['source_query'])}</div>"
                         )
                     st.markdown(
                         dedent(
                             f"""
 <div class='source-card'>
-  <b>{html.escape(h['title'])}</b>
-  <div class='source-meta'>部门: {html.escape(h['dept'])} ｜ 相似度: {h['score']:.2f}</div>
-  {question_html}
-  <div style='margin-top: 8px'>{html.escape(h['chunk'])}</div>
-  <div style='margin-top: 10px'><a href='{h['url']}' target='_blank'>打开原文</a></div>
+  <div class='source-index'>{idx}</div>
+  <div class='source-body'>
+    <div style='display:flex; justify-content:space-between; align-items:center;'>
+        <b style='font-size:1rem;'>{html.escape(h['title'])}</b>
+        <span class='pill' style='font-size:0.7rem;'>相似度 {h['score']:.2f}</span>
+    </div>
+    <div class='source-meta' style='margin-top:2px; margin-bottom:8px;'>部门: {html.escape(h['dept'])}</div>
+    {match_info}
+    <div style='background:rgba(241,245,249,0.5); padding:8px; border-radius:8px; font-size:0.9rem; color:#334155;'>
+        {html.escape(body_text)}
+    </div>
+    <div style='margin-top: 8px; text-align:right;'>
+        <a href='{h['url']}' target='_blank' style='font-size:0.85rem; color:var(--brand-600); text-decoration:none;'>📄 查看原文文档 &rarr;</a>
+    </div>
+  </div>
 </div>
                             """
                         ),
                         unsafe_allow_html=True,
                     )
+                st.markdown("</div>", unsafe_allow_html=True)
             else:
-                st.info("没有满足相似度阈值的引用，可尝试降低阈值或调整关键词。")
+                st.info("未找到满足条件的引用来源。")
 
     with col_right:
         st.markdown(
